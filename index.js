@@ -1,3 +1,4 @@
+// index.js
 require("dotenv").config();
 const { Client, GatewayIntentBits } = require("discord.js");
 const cron = require("node-cron");
@@ -6,14 +7,21 @@ const fs = require("fs");
 const path = require("path");
 
 // -------------------- ENV --------------------
-const PLATS_CHANNEL_ID = process.env.CHANNEL_ID;
-const REMINDER_CHANNEL_ID = process.env.REMINDER_CHANNEL_ID;
+const PLATS_CHANNEL_ID = process.env.CHANNEL_ID;                // channel plats (notes sur photos)
+const REMINDER_CHANNEL_ID = process.env.REMINDER_CHANNEL_ID;    // channel rappels (dhikr/ayah/hadith/adhkar)
 const REMINDER_TIMES = (process.env.REMINDER_TIMES || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
+const MORNING_ADHKAR_TIME = process.env.MORNING_ADHKAR_TIME;    // ex "07:15"
+const EVENING_ADHKAR_TIME = process.env.EVENING_ADHKAR_TIME;    // ex "18:30"
 const TZ = process.env.TZ || "Europe/Brussels";
+
+const HADITH_LANG_PREFIX = (process.env.HADITH_LANG_PREFIX || "fr,eng")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 // -------------------- DISCORD --------------------
 const client = new Client({
@@ -31,28 +39,38 @@ function ensureState() {
   if (!fs.existsSync(statePath)) {
     fs.writeFileSync(
       statePath,
-      JSON.stringify({ usedAyahIds: [], usedDhikrIdx: [], usedHadithKeys: [] }, null, 2)
+      JSON.stringify(
+        { usedAyahIds: [], usedDhikrIdx: [], usedHadithKeys: [] },
+        null,
+        2
+      )
     );
   }
 }
+
 function loadState() {
   ensureState();
   return JSON.parse(fs.readFileSync(statePath, "utf-8"));
 }
+
 function saveState(state) {
   fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
 }
 
-// -------------------- CONTENT --------------------
+// -------------------- CONTENT (local) --------------------
 function readJson(relPath) {
   return JSON.parse(fs.readFileSync(path.join(__dirname, relPath), "utf-8"));
 }
+
 const dhikrList = readJson("content/dhikr.json");
+const morningAdhkar = readJson("content/adhkar_morning.json");
+const eveningAdhkar = readJson("content/adhkar_evening.json");
 
 function pickNonRepeatingIndex(listLength, usedArrName) {
   const state = loadState();
   const used = state[usedArrName] || [];
 
+  // Si tout a été utilisé -> reset (sinon impossible sur une liste finie)
   if (used.length >= listLength) {
     state[usedArrName] = [];
     saveState(state);
@@ -70,6 +88,33 @@ function pickNonRepeatingIndex(listLength, usedArrName) {
   return idx;
 }
 
+// -------------------- PHOTO (plats): seulement upload --------------------
+function hasUploadedImage(message) {
+  if (!message.attachments || message.attachments.size === 0) return false;
+
+  return message.attachments.some((att) => {
+    const ct = att.contentType || "";
+    const url = att.url || "";
+    return ct.startsWith("image/") || /\.(png|jpe?g|gif|webp)$/i.test(url);
+  });
+}
+
+client.on("messageCreate", async (message) => {
+  if (message.author.bot) return;
+  if (message.channel.id !== PLATS_CHANNEL_ID) return;
+
+  // ✅ uniquement si photo envoyée depuis galerie/caméra (attachment)
+  if (!hasUploadedImage(message)) return;
+
+  try {
+    for (const emoji of ratingEmojis) {
+      await message.react(emoji);
+    }
+  } catch (err) {
+    console.error("Erreur réactions :", err);
+  }
+});
+
 // -------------------- AYAH (anti-répétition) --------------------
 async function getNonRepeatingAyah() {
   const state = loadState();
@@ -83,12 +128,12 @@ async function getNonRepeatingAyah() {
 
   let id;
   do {
-    id = Math.floor(Math.random() * 6236) + 1;
+    id = Math.floor(Math.random() * 6236) + 1; // 1..6236
   } while (used.has(id));
 
   const [ar, fr] = await Promise.all([
-    axios.get(`https://api.alquran.cloud/v1/ayah/${id}/quran-uthmani`),
-    axios.get(`https://api.alquran.cloud/v1/ayah/${id}/fr.hamidullah`)
+    axios.get(`https://api.alquran.cloud/v1/ayah/${id}/quran-uthmani`, { timeout: 15000 }),
+    axios.get(`https://api.alquran.cloud/v1/ayah/${id}/fr.hamidullah`, { timeout: 15000 }),
   ]);
 
   state.usedAyahIds = [...used, id];
@@ -102,23 +147,20 @@ async function getNonRepeatingAyah() {
     surahNumber: arData?.surah?.number,
     surah: arData?.surah?.englishName,
     ayahNumberInSurah: arData?.numberInSurah,
-    french: frData?.text
+    french: frData?.text,
   };
 }
 
-// -------------------- HADITH (illimité via API) --------------------
+// -------------------- HADITH (énorme base via API + anti-répétition) --------------------
 const HADITH_BASE = "https://cdn.jsdelivr.net/gh/fawazahmed0/hadith-api@1";
-const HADITH_LANG_PREFIX = (process.env.HADITH_LANG_PREFIX || "fr,eng")
-  .split(",")
-  .map(s => s.trim())
-  .filter(Boolean);
 
 let hadithInfoCache = null;
 let hadithInfoCacheAt = 0;
 
 async function getHadithInfo() {
   const now = Date.now();
-  if (hadithInfoCache && (now - hadithInfoCacheAt) < 24 * 60 * 60 * 1000) return hadithInfoCache;
+  if (hadithInfoCache && now - hadithInfoCacheAt < 24 * 60 * 60 * 1000) return hadithInfoCache;
+
   const { data } = await axios.get(`${HADITH_BASE}/info.min.json`, { timeout: 15000 });
   hadithInfoCache = data;
   hadithInfoCacheAt = now;
@@ -134,7 +176,7 @@ function pickEdition(info) {
   if (!editions.length) return null;
 
   for (const pref of HADITH_LANG_PREFIX) {
-    const match = editions.filter(e => e.startsWith(`${pref}-`));
+    const match = editions.filter((e) => e.startsWith(`${pref}-`));
     if (match.length) return pickRandom(match);
   }
   return pickRandom(editions);
@@ -142,6 +184,7 @@ function pickEdition(info) {
 
 function getMaxHadithNumber(info, editionName) {
   const node = (info?.editions && info.editions[editionName]) || info?.[editionName] || {};
+  // fallback si pas de count fiable
   return node?.hadiths || node?.count || node?.total || 5000;
 }
 
@@ -161,6 +204,7 @@ async function getNonRepeatingHadith() {
 
   const maxNo = getMaxHadithNumber(info, editionName);
 
+  // Retente pour éviter 404 / numéros manquants
   for (let tries = 0; tries < 60; tries++) {
     const hadithNo = Math.floor(Math.random() * maxNo) + 1;
     const key = `${editionName}|${hadithNo}`;
@@ -169,7 +213,10 @@ async function getNonRepeatingHadith() {
     try {
       const h = await fetchHadith(editionName, hadithNo);
 
+      // Marque utilisé
       state.usedHadithKeys.push(key);
+
+      // Limite de mémoire (fenêtre anti-répétition)
       if (state.usedHadithKeys.length > 20000) {
         state.usedHadithKeys = state.usedHadithKeys.slice(-20000);
       }
@@ -188,17 +235,21 @@ async function getNonRepeatingHadith() {
 
       return { text, source };
     } catch (e) {
-      continue; // si numéro absent, on retente
+      continue; // si 404 => on retente
     }
   }
 
   throw new Error("Impossible de récupérer un hadith non répété.");
 }
 
-// -------------------- DAILY MESSAGE --------------------
+// -------------------- SENDERS --------------------
+async function getReminderChannel() {
+  if (!REMINDER_CHANNEL_ID) return null;
+  return await client.channels.fetch(REMINDER_CHANNEL_ID).catch(() => null);
+}
+
 async function sendDailyReminder() {
-  if (!REMINDER_CHANNEL_ID) return;
-  const channel = await client.channels.fetch(REMINDER_CHANNEL_ID).catch(() => null);
+  const channel = await getReminderChannel();
   if (!channel) return;
 
   const dhikr = dhikrList[pickNonRepeatingIndex(dhikrList.length, "usedDhikrIdx")];
@@ -221,54 +272,55 @@ _${hadith.text}_
   await channel.send(msg);
 }
 
-// -------------------- PLATS: réactions uniquement si PHOTO upload --------------------
-function hasUploadedImage(message) {
-  if (!message.attachments || message.attachments.size === 0) return false;
+async function sendMorningAdhkar() {
+  const channel = await getReminderChannel();
+  if (!channel) return;
 
-  return message.attachments.some((att) => {
-    const ct = att.contentType || "";
-    const url = att.url || "";
-    return ct.startsWith("image/") || /\.(png|jpe?g|gif|webp)$/i.test(url);
-  });
+  const lines = morningAdhkar.map((x) => `• ${x}`).join("\n");
+  await channel.send(`🌅 **Adhkār du matin**\n${lines}`);
 }
 
-client.on("messageCreate", async (message) => {
-  if (message.author.bot) return;
-  if (message.channel.id !== PLATS_CHANNEL_ID) return;
-  if (!hasUploadedImage(message)) return;
+async function sendEveningAdhkar() {
+  const channel = await getReminderChannel();
+  if (!channel) return;
 
-  try {
-    for (const emoji of ratingEmojis) {
-      await message.react(emoji);
-    }
-  } catch (err) {
-    console.error("Erreur réactions :", err);
-  }
-});
+  const lines = eveningAdhkar.map((x) => `• ${x}`).join("\n");
+  await channel.send(`🌙 **Adhkār du soir**\n${lines}`);
+}
 
 // -------------------- SCHEDULER --------------------
-function startSchedules() {
-  if (REMINDER_TIMES.length === 0) {
-    console.log("ℹ️ REMINDER_TIMES vide → pas de rappels planifiés.");
+function scheduleAt(timeStr, fn, label) {
+  if (!timeStr) return;
+  const [hh, mm] = timeStr.split(":").map(Number);
+  if (Number.isNaN(hh) || Number.isNaN(mm)) {
+    console.log(`⚠️ Heure invalide ignorée (${label}): ${timeStr}`);
     return;
   }
-
-  for (const t of REMINDER_TIMES) {
-    const [hh, mm] = t.split(":").map(Number);
-    if (Number.isNaN(hh) || Number.isNaN(mm)) {
-      console.log(`⚠️ Heure invalide ignorée: ${t}`);
-      continue;
-    }
-
-    const expr = `${mm} ${hh} * * *`;
-    cron.schedule(expr, () => {
-      sendDailyReminder().catch(err => console.error("Erreur reminder:", err));
-    }, { timezone: TZ });
-
-    console.log(`✅ Rappel programmé à ${t} (${TZ})`);
-  }
+  const expr = `${mm} ${hh} * * *`;
+  cron.schedule(
+    expr,
+    () => fn().catch((err) => console.error(`Erreur ${label}:`, err)),
+    { timezone: TZ }
+  );
+  console.log(`✅ ${label} programmé à ${timeStr} (${TZ})`);
 }
 
+function startSchedules() {
+  // Rappels dhikr/ayah/hadith aux heures demandées
+  if (REMINDER_TIMES.length === 0) {
+    console.log("ℹ️ REMINDER_TIMES vide → pas de rappel dhikr/ayah/hadith planifié.");
+  } else {
+    for (const t of REMINDER_TIMES) {
+      scheduleAt(t, sendDailyReminder, "Rappel (Dhikr/Ayah/Hadith)");
+    }
+  }
+
+  // Adhkar matin / soir
+  scheduleAt(MORNING_ADHKAR_TIME, sendMorningAdhkar, "Adhkār matin");
+  scheduleAt(EVENING_ADHKAR_TIME, sendEveningAdhkar, "Adhkār soir");
+}
+
+// -------------------- READY --------------------
 client.once("clientReady", () => {
   console.log(`✅ Bot connecté : ${client.user.tag}`);
   startSchedules();
