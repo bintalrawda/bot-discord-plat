@@ -5,7 +5,7 @@ const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
 
-// ================== ENV ==================
+// ================= ENV =================
 const PLATS_CHANNEL_ID = process.env.CHANNEL_ID;
 const REMINDER_CHANNEL_ID = process.env.REMINDER_CHANNEL_ID;
 
@@ -22,14 +22,14 @@ const HADITH_LANG_PREFIX = (process.env.HADITH_LANG_PREFIX || "fr,eng")
   .split(",")
   .map(s => s.trim());
 
-// ================== DISCORD ==================
+// ================= DISCORD =================
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
 });
 
 const ratingEmojis = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"];
 
-// ================== STATE ==================
+// ================= STATE =================
 const dataDir = path.join(__dirname, "data");
 const statePath = path.join(dataDir, "state.json");
 
@@ -38,7 +38,6 @@ function ensureState() {
   if (!fs.existsSync(statePath)) {
     fs.writeFileSync(statePath, JSON.stringify({
       usedAyahIds: [],
-      usedDhikrIdx: [],
       usedHadithKeys: []
     }, null, 2));
   }
@@ -53,40 +52,36 @@ function saveState(state) {
   fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
 }
 
-// ================== CONTENT ==================
-function readJson(file) {
-  return JSON.parse(fs.readFileSync(path.join(__dirname, file)));
-}
-
-const dhikrList = readJson("content/dhikr.json");
-const morningAdhkar = readJson("content/adhkar_morning.json");
-const eveningAdhkar = readJson("content/adhkar_evening.json");
-
-// ================== PHOTO NOTES ==================
-function hasUploadedImage(message) {
+// ================= PHOTO NOTES (STRICT) =================
+function hasUploadedImageOnly(message) {
   if (!message.attachments || message.attachments.size === 0) return false;
+
   return message.attachments.some(att => {
-    const ct = att.contentType || "";
-    return ct.startsWith("image/");
+    const ct = (att.contentType || "").toLowerCase();
+    const name = (att.name || "").toLowerCase();
+
+    if (ct.startsWith("image/")) return true;
+    return /\.(png|jpe?g|gif|webp)$/i.test(name);
   });
 }
 
 client.on("messageCreate", async (message) => {
   if (message.author.bot) return;
   if (message.channel.id !== PLATS_CHANNEL_ID) return;
-  if (!hasUploadedImage(message)) return;
+  if (!hasUploadedImageOnly(message)) return;
 
   try {
+    if (message.reactions.cache.size > 0) return;
     for (const emoji of ratingEmojis) {
       await message.react(emoji);
     }
   } catch (err) {
-    console.error("Erreur réactions :", err);
+    console.error("Erreur réactions:", err);
   }
 });
 
-// ================== AYAH ==================
-async function getNonRepeatingAyah() {
+// ================= AYAH =================
+async function getAyah() {
   const state = loadState();
   const used = new Set(state.usedAyahIds);
 
@@ -112,22 +107,23 @@ async function getNonRepeatingAyah() {
   };
 }
 
-// ================== HADITH ILLIMITÉ ==================
+// ================= HADITH ILLIMITÉ =================
 const HADITH_BASE = "https://cdn.jsdelivr.net/gh/fawazahmed0/hadith-api@1";
 
-async function getNonRepeatingHadith() {
+async function getHadith() {
   const state = loadState();
   state.usedHadithKeys ||= [];
 
   const { data: info } = await axios.get(`${HADITH_BASE}/info.min.json`);
   const editions = Object.keys(info.editions);
 
-  let edition = editions.find(e => HADITH_LANG_PREFIX.some(pref => e.startsWith(pref))) 
-                || editions[Math.floor(Math.random() * editions.length)];
+  let edition =
+    editions.find(e => HADITH_LANG_PREFIX.some(pref => e.startsWith(pref)))
+    || editions[Math.floor(Math.random() * editions.length)];
 
   const max = info.editions[edition].hadiths || 5000;
 
-  for (let i = 0; i < 60; i++) {
+  for (let i = 0; i < 50; i++) {
     const num = Math.floor(Math.random() * max) + 1;
     const key = `${edition}|${num}`;
     if (state.usedHadithKeys.includes(key)) continue;
@@ -147,25 +143,16 @@ async function getNonRepeatingHadith() {
   }
 }
 
-// ================== SENDERS ==================
-async function getReminderChannel() {
-  if (!REMINDER_CHANNEL_ID) return null;
-  return await client.channels.fetch(REMINDER_CHANNEL_ID).catch(() => null);
-}
-
+// ================= REMINDERS =================
 async function sendDailyReminder() {
-  const channel = await getReminderChannel();
+  const channel = await client.channels.fetch(REMINDER_CHANNEL_ID).catch(() => null);
   if (!channel) return;
 
-  const dhikr = dhikrList[Math.floor(Math.random() * dhikrList.length)];
-  const ayah = await getNonRepeatingAyah();
-  const hadith = await getNonRepeatingHadith();
+  const ayah = await getAyah();
+  const hadith = await getHadith();
 
   await channel.send(
-`🟢 **Dhikr**
-• ${dhikr}
-
-📖 **Verset**
+`📖 **Verset**
 Sourate ${ayah.surahNumber} (${ayah.surah}) - Ayah ${ayah.ayahNumber}
 ${ayah.arabic}
 _${ayah.french}_
@@ -177,27 +164,25 @@ _${hadith.text}_
 }
 
 async function sendMorningAdhkar() {
-  const channel = await getReminderChannel();
+  const channel = await client.channels.fetch(REMINDER_CHANNEL_ID).catch(() => null);
   if (!channel) return;
 
-  const text = morningAdhkar.map(a => `• ${a}`).join("\n");
-  await channel.send(`🌅 **Adhkār du matin**\n${text}`);
+  await channel.send("🌅 **Adhkār du matin**");
 }
 
 async function sendEveningAdhkar() {
-  const channel = await getReminderChannel();
+  const channel = await client.channels.fetch(REMINDER_CHANNEL_ID).catch(() => null);
   if (!channel) return;
 
-  const text = eveningAdhkar.map(a => `• ${a}`).join("\n");
-  await channel.send(`🌙 **Adhkār du soir**\n${text}`);
+  await channel.send("🌙 **Adhkār du soir**");
 }
 
-// ================== SCHEDULER ==================
+// ================= SCHEDULER =================
 function scheduleAt(time, fn) {
   if (!time) return;
   const [hh, mm] = time.split(":").map(Number);
   const expr = `${mm} ${hh} * * *`;
-  cron.schedule(expr, () => fn(), { timezone: TZ });
+  cron.schedule(expr, fn, { timezone: TZ });
 }
 
 client.once("clientReady", () => {
